@@ -28,13 +28,18 @@ ${lottieSrc}
   var STYLE_PROPS = ${propsJson};
   window._seEditMode = true;
 
+  // ---------- Force pointer events in Editor mode ----------
+  // Guarantees all elements are selectable and draggable even if CSS specifies pointer-events: none!
+  var pointerStyle = document.createElement('style');
+  pointerStyle.textContent = 'body._se-edit-mode, body._se-edit-mode * { pointer-events: auto !important; cursor: pointer !important; }';
+  document.head.appendChild(pointerStyle);
+  document.body.classList.add('_se-edit-mode');
+
   // ---------- Runtime error capture ----------
-  // Relays widget JS errors (e.g. "$ is not defined") to the parent app so
-  // they can be shown directly in the UI instead of only in devtools console.
   var _reportedErrors = {};
   function reportError(message, source, lineno, colno, stack) {
     var key = message + '|' + lineno + '|' + colno;
-    if (_reportedErrors[key]) return; // de-dupe repeated errors (e.g. from loops)
+    if (_reportedErrors[key]) return;
     _reportedErrors[key] = true;
     try {
       parent.postMessage({
@@ -142,7 +147,7 @@ ${lottieSrc}
     }
   };
 
-  // SE_API global alias (some widgets use SE_API directly)
+  // SE_API global alias
   window.SE_API = {
     counters: {
       get: function(name, cb) { if (typeof cb === 'function') cb({ counter: name, value: 0 }); },
@@ -193,6 +198,11 @@ ${lottieSrc}
     try { return document.querySelector(selector); } catch(e) { return null; }
   }
 
+  // ---------- Hover highlight box ----------
+  var hoverBox = document.createElement('div');
+  hoverBox.style.cssText = 'position:fixed;pointer-events:none;border:1.5px dashed rgba(16,185,129,0.9);background:rgba(16,185,129,0.08);z-index:2147483000;display:none;box-sizing:border-box;';
+  document.documentElement.appendChild(hoverBox);
+
   function getRect(el) {
     var r = el.getBoundingClientRect();
     return { top: r.top, left: r.left, width: r.width, height: r.height };
@@ -219,11 +229,6 @@ ${lottieSrc}
       innerHTML: el.outerHTML ? el.outerHTML.substring(0, 500) : ''
     };
   }
-
-  // ---------- Hover highlight box ----------
-  var hoverBox = document.createElement('div');
-  hoverBox.style.cssText = 'position:fixed;pointer-events:none;border:1.5px dashed rgba(16,185,129,0.9);background:rgba(16,185,129,0.08);z-index:2147483000;display:none;box-sizing:border-box;';
-  document.documentElement.appendChild(hoverBox);
 
   document.addEventListener('mouseover', function(e) {
     if (!window._seEditMode) return;
@@ -325,6 +330,22 @@ ${lottieSrc}
     if (e.data._source !== 'se-mock') return;
     var msg = e.data;
 
+    if (msg.type === 'FIELD_BUTTON_CLICKED') {
+      var fieldKey = msg.key;
+      var btnEvent = new CustomEvent('onEventReceived', {
+        detail: {
+          listener: 'field-button',
+          event: {
+            field: fieldKey,
+            name: fieldKey,
+            value: fieldKey
+          }
+        }
+      });
+      window.dispatchEvent(btnEvent);
+      window.dispatchEvent(new CustomEvent('se-field-button', { detail: { key: fieldKey } }));
+    }
+
     if (msg.type === 'FIRE_EVENT') {
       var eventType = msg.eventType;
       var eventData = msg.eventData || {};
@@ -338,12 +359,9 @@ ${lottieSrc}
         };
         window.legacyEvents.trigger(legacyMap[eventType] || eventType, eventData);
       }
-      // Custom DOM event (widgets using window.addEventListener('se-tip', ...))
       var customEvent = new CustomEvent('se-' + eventType, { detail: eventData });
       window.dispatchEvent(customEvent);
 
-      // Real SE dispatch shape: onEventReceived with { detail: { listener, event } }
-      // This is what most modern SE custom widgets actually listen to.
       var listenerMap = {
         'tip': 'tip-latest',
         'follower': 'follower-latest',
@@ -359,11 +377,58 @@ ${lottieSrc}
         'sub_milestone': 'subscriber-milestone'
       };
       var listener = listenerMap[eventType] || (eventType + '-latest');
+      var finalEvent = eventData;
+      if (listener === 'message') {
+        var BADGE_URLS = {
+          'moderator': 'https://static-cdn.jtvnw.net/badges/v1/3262bbd7-e4bf-4b12-89cd-e61c5550a1d3/3',
+          'subscriber': 'https://static-cdn.jtvnw.net/badges/v1/5d27b58c-7f8e-43ae-890d-275d3db953b3/3',
+          'broadcaster': 'https://static-cdn.jtvnw.net/badges/v1/552730c2-f34a-4fd9-87a7-33f7ccaa60a3/3',
+          'vip': 'https://static-cdn.jtvnw.net/badges/v1/b81c956d-1347-434b-b4f0-d0b2f3559d1e/3'
+        };
+        var mappedBadges = [];
+        if (eventData.badges) {
+          mappedBadges = eventData.badges.map(function(b) {
+            return {
+              type: b.type,
+              version: b.version || '1',
+              url: BADGE_URLS[b.type] || ''
+            };
+          });
+        } else if (eventData.tags && eventData.tags.badges) {
+          var parts = eventData.tags.badges.split(',');
+          parts.forEach(function(p) {
+            var spl = p.split('/');
+            if (spl[0]) {
+              mappedBadges.push({
+                type: spl[0],
+                version: spl[1] || '1',
+                url: BADGE_URLS[spl[0]] || ''
+              });
+            }
+          });
+        }
+        finalEvent = {
+          data: {
+            time: Date.now(),
+            tags: eventData.tags || {
+              badges: eventData.badges ? eventData.badges.map(function(b) { return b.type + '/1'; }).join(',') : '',
+              color: eventData.color || '#ffffff',
+              'display-name': eventData.displayName || eventData.nick,
+              mod: eventData.type === 'chat-mod' || eventData.type === 'chat-admin' ? '1' : '0',
+              subscriber: eventData.type === 'chat-subscriber' ? '1' : '0',
+              vip: eventData.type === 'chat-vip' ? '1' : '0'
+            },
+            nick: eventData.nick,
+            text: eventData.text,
+            displayName: eventData.displayName || eventData.nick,
+            badges: mappedBadges
+          }
+        };
+      }
       var seEvent = new CustomEvent('onEventReceived', {
         detail: {
           listener: listener,
-          event: eventData,
-          // Some widgets read event.detail.event.tags/name directly
+          event: finalEvent
         }
       });
       window.dispatchEvent(seEvent);
@@ -373,7 +438,6 @@ ${lottieSrc}
       if (msg.dataKey === 'fields') {
         try {
           var parsed = JSON.parse(msg.dataValue || '{}');
-          // Replace all keys to reflect true current state (including cleared overrides)
           for (var k in window.se_module.options) delete window.se_module.options[k];
           Object.assign(window.se_module.options, parsed);
           _fields = window.se_module.options;
@@ -385,7 +449,6 @@ ${lottieSrc}
           _data = window.se_module.data;
         } catch(e) {}
       }
-      // Fire the widget's onWidgetLoad again so it re-reads settings
       if (typeof window._seRefireWidgetLoad === 'function') {
         try { window._seRefireWidgetLoad(); } catch(e) { console.error(e); }
       }
@@ -400,7 +463,12 @@ ${lottieSrc}
 
     if (msg.type === 'SET_EDIT_MODE') {
       window._seEditMode = !!msg.enabled;
-      if (!window._seEditMode) hoverBox.style.display = 'none';
+      if (window._seEditMode) {
+        document.body.classList.add('_se-edit-mode');
+      } else {
+        document.body.classList.remove('_se-edit-mode');
+        hoverBox.style.display = 'none';
+      }
     }
 
     if (msg.type === 'GET_RECT') {
@@ -464,8 +532,6 @@ ${lottieSrc}
   });
 
   // ---------- Fire the SE onWidgetLoad event ----------
-  // This is what most SE custom widgets listen for. Payload mirrors the real
-  // shape SE provides: { detail: { channel, session, fieldData, currency, recents } }.
   function fireWidgetLoad() {
     var payload = {
       channel: {
@@ -490,10 +556,9 @@ ${lottieSrc}
     }
   }
 
-  // ---------- Re-fire widget:load when fields change (emulator setting change) ----------
+  // ---------- Re-fire widget:load when fields change ----------
   function refireOnFieldsUpdate() {
     fireWidgetLoad();
-    // Also fire a generic "onSessionUpdate" some widgets listen for
     var evt = new CustomEvent('onSessionUpdate', {
       detail: { session: { data: _data, settings: _fields } }
     });
@@ -503,12 +568,10 @@ ${lottieSrc}
   window.addEventListener('load', function() {
     initLotties();
     sendLayers();
-    // Fire widget:load after everything is ready
     setTimeout(fireWidgetLoad, 30);
   });
   setTimeout(function() { initLotties(); sendLayers(); }, 50);
 
-  // Expose so parent can trigger re-fire on field updates
   window._seRefireWidgetLoad = refireOnFieldsUpdate;
 
   console.log('[SE Mock] Initialized with fields:', _fields, 'data:', _data);
