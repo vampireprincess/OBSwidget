@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useReducer, useCallback, useState, type ReactNode } from 'react';
 import type {
   AppState,
   LeftTab,
@@ -14,6 +14,24 @@ import type {
 import { validateJson } from './utils/zipUtils';
 
 const TABS_ARR: LeftTab[] = ['html', 'css', 'js', 'fields', 'data'];
+
+export function cleanSECdnUrls(content: string): string {
+  if (!content) return content;
+  // Completely bulletproof StreamElements CDN trailing slash remover
+  let cleaned = content.replace(/(https:\/\/cdn\.streamelements\.com\/uploads\/[^\s\"\'\`\<\>\(\)\[\]\/]+)\//gi, '$1');
+  cleaned = cleaned.replace(/(\.png|\.jpe?g|\.gif|\.webp|\.webm|\.mp4|\.json)\//gi, '$1');
+  return cleaned;
+}
+
+function pushHistory(history: Array<Record<LeftTab, CodeFile>>, index: number, files: Record<LeftTab, CodeFile>) {
+  const newHistory = history.slice(0, index + 1);
+  newHistory.push(JSON.parse(JSON.stringify(files)));
+  if (newHistory.length > 50) newHistory.shift();
+  return {
+    history: newHistory,
+    index: newHistory.length - 1,
+  };
+}
 
 function defaultFiles(): Record<LeftTab, CodeFile> {
   const map: Record<LeftTab, string> = {
@@ -218,8 +236,19 @@ console.log('Widget script initialized. Fire events from the Emulator "Test Even
   return result;
 }
 
-const initialState: AppState = {
+export interface CustomDialog {
+  type: 'alert' | 'confirm' | 'prompt';
+  title: string;
+  message: string;
+  defaultValue?: string;
+  onConfirm: (value?: string) => void;
+  onCancel?: () => void;
+}
+
+const initialState: AppState & { dialog: CustomDialog | null } = {
   codeFiles: defaultFiles(),
+  history: [],
+  historyIndex: -1,
   cssOverrides: [],
   assets: [],
   selectedElement: null,
@@ -235,11 +264,14 @@ const initialState: AppState = {
   cssVariables: [],
   viewMode: 'editor',
   fieldValueOverrides: {},
+  dialog: null,
 };
 
 type Action =
   | { type: 'SET_FILES'; files: Record<LeftTab, CodeFile>; folderPath?: string }
   | { type: 'SET_FILE_CONTENT'; tab: LeftTab; content: string }
+  | { type: 'UNDO' }
+  | { type: 'REDO' }
   | { type: 'SET_ASSETS'; assets: Asset[] }
   | { type: 'ADD_ASSET'; asset: Asset }
   | { type: 'REMOVE_ASSET'; id: string }
@@ -262,22 +294,69 @@ type Action =
   | { type: 'REMOVE_CSS_VARIABLE'; index: number }
   | { type: 'SET_VIEW_MODE'; mode: ViewMode }
   | { type: 'SET_FIELD_OVERRIDE'; key: string; value: unknown }
-  | { type: 'RESET_FIELD_OVERRIDES' };
+  | { type: 'RESET_FIELD_OVERRIDES' }
+  | { type: 'SET_DIALOG'; dialog: CustomDialog | null };
 
-function reducer(state: AppState, action: Action): AppState {
+function reducer(state: any, action: Action): any {
   switch (action.type) {
-    case 'SET_FILES':
-      return { ...state, codeFiles: action.files, uploadError: null, folderPath: action.folderPath };
+    case 'SET_FILES': {
+      const cleanedFiles = { ...action.files };
+      for (const tab of Object.keys(cleanedFiles) as LeftTab[]) {
+        cleanedFiles[tab] = {
+          ...cleanedFiles[tab],
+          content: cleanSECdnUrls(cleanedFiles[tab].content),
+        };
+      }
+      const hist = pushHistory(state.history, state.historyIndex, cleanedFiles);
+      return { 
+        ...state, 
+        codeFiles: cleanedFiles, 
+        history: hist.history,
+        historyIndex: hist.index,
+        uploadError: null, 
+        folderPath: action.folderPath 
+      };
+    }
     case 'SET_FILE_CONTENT': {
       const { tab, content } = action;
-      const file = { ...state.codeFiles[tab], content };
+      const cleaned = cleanSECdnUrls(content);
+      const file = { ...state.codeFiles[tab], content: cleaned };
       if (tab === 'fields' || tab === 'data') {
         file.parseError = validateJson(content) ?? undefined;
       }
+      const nextFiles = { ...state.codeFiles, [tab]: file };
+      let hist = { history: state.history, index: state.historyIndex };
+      if (state.history.length === 0 || JSON.stringify(state.history[state.historyIndex]) !== JSON.stringify(nextFiles)) {
+        hist = pushHistory(state.history, state.historyIndex, nextFiles);
+      }
       return {
         ...state,
-        codeFiles: { ...state.codeFiles, [tab]: file },
+        codeFiles: nextFiles,
+        history: hist.history,
+        historyIndex: hist.index,
       };
+    }
+    case 'UNDO': {
+      if (state.historyIndex > 0) {
+        const nextIndex = state.historyIndex - 1;
+        return {
+          ...state,
+          codeFiles: JSON.parse(JSON.stringify(state.history[nextIndex])),
+          historyIndex: nextIndex,
+        };
+      }
+      return state;
+    }
+    case 'REDO': {
+      if (state.historyIndex < state.history.length - 1) {
+        const nextIndex = state.historyIndex + 1;
+        return {
+          ...state,
+          codeFiles: JSON.parse(JSON.stringify(state.history[nextIndex])),
+          historyIndex: nextIndex,
+        };
+      }
+      return state;
     }
     case 'SET_ASSETS':
       return { ...state, assets: action.assets };
@@ -290,7 +369,7 @@ function reducer(state: AppState, action: Action): AppState {
     case 'SET_ACTIVE_LEFT_TAB':
       return { ...state, activeLeftTab: action.tab };
     case 'SET_ACTIVE_RIGHT_PANEL':
-      return { ...state, activeRightPanel: action.panel };
+      return { ...state, activeRightPanel: action.panel, rightPanelOpen: true };
     case 'TOGGLE_LEFT_PANEL':
       return { ...state, leftPanelOpen: !state.leftPanelOpen };
     case 'TOGGLE_RIGHT_PANEL':
@@ -303,7 +382,7 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, uploadError: action.error };
     case 'UPDATE_CSS_OVERRIDE': {
       const overrides = [...state.cssOverrides];
-      const idx = overrides.findIndex(o => o.selector === action.selector);
+      const idx = overrides.findIndex((o: any) => o.selector === action.selector);
       if (idx >= 0) {
         overrides[idx] = { ...overrides[idx], properties: { ...overrides[idx].properties, ...action.properties } };
       } else {
@@ -316,13 +395,13 @@ function reducer(state: AppState, action: Action): AppState {
     case 'SET_LAYERS':
       return { ...state, layers: action.layers };
     case 'UPDATE_LAYER': {
-      const layers = state.layers.map(l =>
+      const layers = state.layers.map((l: any) =>
         l.id === action.id ? { ...l, ...action.changes } : l
       );
       return { ...state, layers };
     }
     case 'MOVE_LAYER': {
-      const idx = state.layers.findIndex(l => l.id === action.id);
+      const idx = state.layers.findIndex((l: any) => l.id === action.id);
       if (idx < 0) return state;
       const newLayers = [...state.layers];
       if (action.direction === 'up' && idx > 0) {
@@ -342,19 +421,24 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, cssVariables: vars };
     }
     case 'REMOVE_CSS_VARIABLE':
-      return { ...state, cssVariables: state.cssVariables.filter((_, i) => i !== action.index) };
+      return { ...state, cssVariables: state.cssVariables.filter((_: any, i: number) => i !== action.index) };
     case 'SET_VIEW_MODE':
       return { ...state, viewMode: action.mode };
     case 'SET_FIELD_OVERRIDE':
       return { ...state, fieldValueOverrides: { ...state.fieldValueOverrides, [action.key]: action.value } };
     case 'RESET_FIELD_OVERRIDES':
       return { ...state, fieldValueOverrides: {} };
+    case 'SET_DIALOG':
+      return { ...state, dialog: action.dialog };
     default:
       return state;
   }
 }
 
 interface AppContextType extends AppState {
+  dialog: CustomDialog | null;
+  projectsBrowserOpen: boolean;
+  setProjectsBrowserOpen: (open: boolean) => void;
   setFileContent: (tab: LeftTab, content: string) => void;
   setFiles: (files: Record<LeftTab, CodeFile>, folderPath?: string) => void;
   addAsset: (asset: Asset) => void;
@@ -378,6 +462,16 @@ interface AppContextType extends AppState {
   setViewMode: (mode: ViewMode) => void;
   setFieldOverride: (key: string, value: unknown) => void;
   resetFieldOverrides: () => void;
+  undo: () => void;
+  redo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
+  openDialog: (dialog: CustomDialog) => void;
+  closeDialog: () => void;
+  saveProject: (name: string) => void;
+  loadProject: (name: string) => void;
+  deleteProject: (name: string) => void;
+  getSavedProjects: () => string[];
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -390,6 +484,7 @@ export function useApp(): AppContextType {
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
+  const [projectsBrowserOpen, setProjectsBrowserOpen] = useState(false);
 
   const setFileContent = useCallback((tab: LeftTab, content: string) => {
     dispatch({ type: 'SET_FILE_CONTENT', tab, content });
@@ -487,9 +582,99 @@ export function AppProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'RESET_FIELD_OVERRIDES' });
   }, []);
 
+  const undo = useCallback(() => {
+    dispatch({ type: 'UNDO' });
+  }, []);
+
+  const redo = useCallback(() => {
+    dispatch({ type: 'REDO' });
+  }, []);
+
+  const canUndo = state.historyIndex > 0;
+  const canRedo = state.historyIndex < state.history.length - 1;
+
+  const openDialog = useCallback((dialog: CustomDialog) => {
+    dispatch({ type: 'SET_DIALOG', dialog });
+  }, []);
+
+  const closeDialog = useCallback(() => {
+    dispatch({ type: 'SET_DIALOG', dialog: null });
+  }, []);
+
+  const saveProject = useCallback((name: string) => {
+    try {
+      const projects = JSON.parse(localStorage.getItem('obswidget_saved_projects') || '{}');
+      projects[name] = {
+        fileName: name,
+        codeFiles: state.codeFiles,
+        cssOverrides: state.cssOverrides,
+        assets: state.assets,
+        cssVariables: state.cssVariables,
+        fieldValueOverrides: state.fieldValueOverrides,
+      };
+      localStorage.setItem('obswidget_saved_projects', JSON.stringify(projects));
+      setFileName(name);
+    } catch (e) {
+      console.error(e);
+    }
+  }, [state, setFileName]);
+
+  const loadProject = useCallback((name: string) => {
+    try {
+      const projects = JSON.parse(localStorage.getItem('obswidget_saved_projects') || '{}');
+      const proj = projects[name];
+      if (proj) {
+        // Clean all URLs of the loaded project's files on the fly
+        const cleanedFiles = { ...proj.codeFiles };
+        for (const tab of Object.keys(cleanedFiles) as LeftTab[]) {
+          cleanedFiles[tab] = {
+            ...cleanedFiles[tab],
+            content: cleanSECdnUrls(cleanedFiles[tab].content),
+          };
+        }
+        setFiles(cleanedFiles);
+        setFileName(proj.fileName);
+        dispatch({ type: 'SET_CSS_OVERRIDES', overrides: proj.cssOverrides || [] });
+        dispatch({ type: 'SET_ASSETS', assets: proj.assets || [] });
+        dispatch({ type: 'SET_CSS_VARIABLES', variables: proj.cssVariables || [] });
+        
+        if (proj.fieldValueOverrides) {
+          dispatch({ type: 'RESET_FIELD_OVERRIDES' });
+          Object.entries(proj.fieldValueOverrides).forEach(([k, v]) => {
+            const cleanedVal = typeof v === 'string' ? cleanSECdnUrls(v) : v;
+            dispatch({ type: 'SET_FIELD_OVERRIDE', key: k, value: cleanedVal });
+          });
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, [setFiles, setFileName]);
+
+  const deleteProject = useCallback((name: string) => {
+    try {
+      const projects = JSON.parse(localStorage.getItem('obswidget_saved_projects') || '{}');
+      delete projects[name];
+      localStorage.setItem('obswidget_saved_projects', JSON.stringify(projects));
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  const getSavedProjects = useCallback(() => {
+    try {
+      const projects = JSON.parse(localStorage.getItem('obswidget_saved_projects') || '{}');
+      return Object.keys(projects);
+    } catch {
+      return [];
+    }
+  }, []);
+
   return (
     <AppContext.Provider value={{
       ...state,
+      projectsBrowserOpen,
+      setProjectsBrowserOpen,
       setFileContent,
       setFiles,
       setFileName,
@@ -513,6 +698,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setViewMode,
       setFieldOverride,
       resetFieldOverrides,
+      undo,
+      redo,
+      canUndo,
+      canRedo,
+      openDialog,
+      closeDialog,
+      saveProject,
+      loadProject,
+      deleteProject,
+      getSavedProjects,
     }}>
       {children}
     </AppContext.Provider>

@@ -40,6 +40,7 @@ export interface SelectedElementInfo {
 // Event types for the fake event tester
 export interface FakeEvent {
   type: string;
+  eventType?: string;
   label: string;
   icon: string;
   description: string;
@@ -68,6 +69,8 @@ export interface SEField {
 // App state
 export interface AppState {
   codeFiles: Record<LeftTab, CodeFile>;
+  history: Array<Record<LeftTab, CodeFile>>;
+  historyIndex: number;
   cssOverrides: CSSEntry[];
   assets: Asset[];
   selectedElement: SelectedElementInfo | null;
